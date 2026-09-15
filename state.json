@@ -1,3 +1,8 @@
 {
-  "alert:Slots open but none fit": 1789451005.7101336
+  "alert:Slots open but none fit": 1789451005.7101336,
+  "booked": {
+    "booked_at": "2026-09-15T09:17:30.603011+02:00",
+    "label": "Umschreibung auslaendischer Fuehrerschein (sonstige Staaten)",
+    "when": "2026-10-27T13:10:00+01:00"
+  }
 }

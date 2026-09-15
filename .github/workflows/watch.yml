@@ -1,0 +1,487 @@
+name: termin-watch
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Walk the whole flow but never submit the final booking"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: termin-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -q requests icalendar recurring-ical-events
+
+      - name: Write watcher
+        run: |
+          cat > watcher.py <<'ENDOFWATCHER'
+          #!/usr/bin/env python3
+          """
+          Duesseldorf TEVIS appointment watcher + auto-booker.
+
+          Polls termine.duesseldorf.de for a given Anliegen, filters open slots against
+          fixed rules + a live iCal feed, books the best one, and emails the result.
+
+          Env (all optional except where noted):
+            ICS_URL        secret iCal address of the calendar to check for conflicts
+            SMTP_USER      gmail address used to send
+            SMTP_PASS      gmail app password
+            MAIL_TO        recipient (defaults to SMTP_USER)
+            BOOK_SEX       w | m | u
+            BOOK_VORNAME   first name          (required for autobook)
+            BOOK_NACHNAME  last name           (required for autobook)
+            BOOK_EMAIL     email for the city  (required for autobook)
+            BOOK_PHONE     optional
+            BOOK_DOB       dd.mm.yyyy          (required for autobook)
+            DRY_RUN        "1" -> never submit the final booking POST
+          """
+
+          from __future__ import annotations
+
+          import html
+          import json
+          import os
+          import re
+          import smtplib
+          import sys
+          import time
+          from datetime import date, datetime, timedelta, timezone
+          from email.message import EmailMessage
+          from pathlib import Path
+          from zoneinfo import ZoneInfo
+
+          import requests
+
+          ROOT = Path(__file__).resolve().parent
+          CFG = {
+              "base": "https://termine.duesseldorf.de",
+              "md": 3,
+              "mdt": 402,
+              "loc": 394,
+              "concerns": [
+                  {
+                      "cnc": 5871,
+                      "label": "Umschreibung auslaendischer Fuehrerschein (sonstige Staaten)"
+                  }
+              ],
+              "autobook": True,
+              "rules": {
+                  "min_days_ahead": 2,
+                  "max_days_ahead": 365,
+                  "weekdays": None,
+                  "earliest": "07:00",
+                  "latest": "17:00",
+                  "duration_minutes": 15,
+                  "buffer_minutes": 45,
+                  "blackout": [
+                      [
+                          "2026-10-28",
+                          "2026-12-03"
+                      ]
+                  ],
+                  "calendar_conflicts": "prefer_free"
+              },
+              "alert_cooldown_minutes": 120
+          }
+          STATE_PATH = ROOT / "state.json"
+          TZ = ZoneInfo("Europe/Berlin")
+          UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36")
+          DRY = os.environ.get("DRY_RUN") == "1"
+
+          log = lambda *a: print(*a, flush=True)
+
+
+          # ---------------------------------------------------------------- state ----
+          def load_state() -> dict:
+              try:
+                  return json.loads(STATE_PATH.read_text())
+              except Exception:
+                  return {}
+
+
+          def save_state(st: dict) -> None:
+              STATE_PATH.write_text(json.dumps(st, indent=2, sort_keys=True) + "\n")
+
+
+          # ------------------------------------------------------------- scraping ----
+          def new_session() -> requests.Session:
+              s = requests.Session()
+              s.headers.update({"User-Agent": UA, "Accept-Language": "de-DE,de;q=0.9"})
+              s.request = _timeout_wrap(s.request)  # type: ignore[method-assign]
+              return s
+
+
+          def _timeout_wrap(fn):
+              def inner(method, url, **kw):
+                  kw.setdefault("timeout", 30)
+                  return fn(method, url, **kw)
+              return inner
+
+
+          def open_suggest(s: requests.Session, cnc: int) -> requests.Response:
+              """Walk steps 1-4 of the wizard and return the Terminvorschlaege page."""
+              base, mdt, loc = CFG["base"], CFG["mdt"], CFG["loc"]
+              s.get(f"{base}/select2?md={CFG['md']}")
+              step3 = f"{base}/location?mdt={mdt}&select_cnc=1&cnc-{cnc}=1"
+              s.get(step3)
+              return s.post(step3, data={"loc": loc, "select_location": "Weiter"},
+                            headers={"Referer": step3})
+
+
+          SUGGEST_FORM = re.compile(
+              r'<form[^>]*class="[^"]*suggestion_form[^"]*"[^>]*>(.*?)</form>', re.S)
+          HIDDEN = re.compile(r'<input[^>]*type="hidden"[^>]*name="([^"]+)"[^>]*value="([^"]*)"')
+
+
+          def parse_slots(page: str) -> list[dict]:
+              """Extract every bookable slot as its full POST payload."""
+              slots = []
+              for m in SUGGEST_FORM.finditer(page):
+                  fields = {k: html.unescape(v) for k, v in HIDDEN.findall(m.group(1))}
+                  if not {"date", "start", "checksum"} <= fields.keys():
+                      continue
+                  try:
+                      d = datetime.strptime(fields["date"], "%Y%m%d").date()
+                      start = int(fields["start"])
+                  except ValueError:
+                      continue
+                  fields["_dt"] = datetime.combine(
+                      d, datetime.min.time(), TZ) + timedelta(minutes=start)
+                  slots.append(fields)
+              slots.sort(key=lambda f: f["_dt"])
+              return slots
+
+
+          def page_status(page: str) -> str:
+              flat = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", page))
+              if "keine freien Termine" in flat or "Keine Zeiten verf" in page:
+                  return "none"
+              if "suggestion_form" in page:
+                  return "slots"
+              if 'name="captcha_result"' in page:
+                  return "captcha"
+              return "unknown"
+
+
+          # ------------------------------------------------------------- calendar ----
+          def busy_intervals(window_end: datetime) -> list[tuple[datetime, datetime]]:
+              """Expanded busy blocks from the secret iCal feed. Empty on any failure."""
+              url = os.environ.get("ICS_URL", "").strip()
+              if not url:
+                  return []
+              try:
+                  import icalendar
+                  import recurring_ical_events
+                  raw = requests.get(url, timeout=30, headers={"User-Agent": UA}).content
+                  cal = icalendar.Calendar.from_ical(raw)
+                  lo = datetime.now(TZ)
+                  events = recurring_ical_events.of(cal).between(lo, window_end)
+              except Exception as e:  # never let calendar trouble block a booking
+                  log(f"! calendar unavailable ({e}) - falling back to rules only")
+                  return []
+
+              out = []
+              for ev in events:
+                  if str(ev.get("TRANSP", "OPAQUE")).upper() == "TRANSPARENT":
+                      continue
+                  if str(ev.get("STATUS", "")).upper() == "CANCELLED":
+                      continue
+                  a, b = ev.get("DTSTART"), ev.get("DTEND")
+                  if not a:
+                      continue
+                  a = a.dt
+                  b = b.dt if b else None
+                  if isinstance(a, datetime):
+                      a = a.astimezone(TZ) if a.tzinfo else a.replace(tzinfo=TZ)
+                      b = (b.astimezone(TZ) if b.tzinfo else b.replace(tzinfo=TZ)) if isinstance(b, datetime) else a + timedelta(hours=1)
+                  else:  # all-day event
+                      a = datetime.combine(a, datetime.min.time(), TZ)
+                      b = datetime.combine(b or (a.date() + timedelta(days=1)),
+                                           datetime.min.time(), TZ)
+                  out.append((a, b))
+              log(f"  calendar: {len(out)} busy blocks in window")
+              return out
+
+
+          # ---------------------------------------------------------------- rules ----
+          def hhmm(v: str) -> int:
+              h, m = v.split(":")
+              return int(h) * 60 + int(m)
+
+
+          def eligible(slots: list[dict]) -> tuple[list[dict], list[str]]:
+              r = CFG["rules"]
+              today = datetime.now(TZ).date()
+              lo_day = today + timedelta(days=r["min_days_ahead"])
+              hi_day = today + timedelta(days=r["max_days_ahead"])
+              lo_min, hi_min = hhmm(r["earliest"]), hhmm(r["latest"])
+              dur = timedelta(minutes=r["duration_minutes"])
+              buf = timedelta(minutes=r["buffer_minutes"])
+
+              blackout = [(date.fromisoformat(a), date.fromisoformat(b))
+                          for a, b in r.get("blackout", [])]
+              weekdays = r.get("weekdays")  # null/absent = any day the city offers
+
+              by_rule, reasons = [], []
+              for s in slots:
+                  dt = s["_dt"]
+                  mins = dt.hour * 60 + dt.minute
+                  if not (lo_day <= dt.date() <= hi_day):
+                      continue
+                  if any(a <= dt.date() <= b for a, b in blackout):
+                      continue
+                  if weekdays and dt.weekday() not in weekdays:
+                      continue
+                  if not (lo_min <= mins <= hi_min):
+                      continue
+                  by_rule.append(s)
+
+              if not by_rule:
+                  return [], ["no slot matched the date/time rules (blackout, window, horizon)"]
+
+              busy = busy_intervals(max(s["_dt"] for s in by_rule) + timedelta(days=1))
+              free, clashing = [], []
+              for s in by_rule:
+                  a, b = s["_dt"] - buf, s["_dt"] + dur + buf
+                  clash = next((x for x in busy if x[0] < b and a < x[1]), None)
+                  if clash:
+                      s["_clash"] = f"overlaps a calendar entry {clash[0]:%d.%m %H:%M}-{clash[1]:%H:%M}"
+                      reasons.append(f"{s['_dt']:%d.%m %H:%M} {s['_clash']}")
+                      clashing.append(s)
+                  else:
+                      free.append(s)
+
+              if free or r.get("calendar_conflicts", "prefer_free") == "block":
+                  return free, reasons
+              # nothing clean: take a conflicting slot rather than none, and say so
+              return clashing, reasons
+
+
+          # -------------------------------------------------------------- booking ----
+          PERSON_ACTION = re.compile(r'<form[^>]*name="cal_request"[^>]*action="([^"]+)"')
+
+
+          def book(s: requests.Session, slot: dict, base: str) -> tuple[bool, str]:
+              payload = {k: v for k, v in slot.items() if not k.startswith("_")}
+              r = s.post(f"{base}/suggest", data=payload,
+                         headers={"Referer": f"{base}/suggest"})
+              if "cal_request" not in r.text:
+                  return False, f"slot page did not lead to the form ({r.url})"
+              if 'name="captcha_result"' in r.text:
+                  return False, "the city added a captcha to the form - book manually"
+
+              m = PERSON_ACTION.search(r.text)
+              action = html.unescape(m.group(1)) if m else "personaldata"
+              dob = os.environ.get("BOOK_DOB", "").split(".")
+              if len(dob) != 3:
+                  return False, "BOOK_DOB must be dd.mm.yyyy"
+
+              form = {
+                  "sex": os.environ.get("BOOK_SEX", "u"),
+                  "vorname": os.environ["BOOK_VORNAME"],
+                  "nachname": os.environ["BOOK_NACHNAME"],
+                  "email": os.environ["BOOK_EMAIL"],
+                  "emailCheck": os.environ["BOOK_EMAIL"],
+                  "phone": os.environ.get("BOOK_PHONE", ""),
+                  "geburtsdatumDay": dob[0].lstrip("0"),
+                  "geburtsdatumMonth": dob[1].lstrip("0"),
+                  "geburtsdatumYear": dob[2],
+                  "hunangskrukka": "",          # honeypot - must stay empty
+                  "agreementChecked": "on",
+                  "submit": "Reservieren",
+              }
+              if DRY:
+                  return False, f"DRY_RUN: would POST to {action} with {form['vorname']} {form['nachname']}"
+
+              r2 = s.post(f"{base}/{action.lstrip('/')}", data=form,
+                          headers={"Referer": r.url})
+              text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", r2.text))
+              ok = any(k in text for k in ("Schritt 6", "reserviert", "Buchung",
+                                           "Bestätigung", "Vielen Dank"))
+              snippet = text[text.find("Schritt"):][:700] if "Schritt" in text else text[:700]
+              return ok, snippet
+
+
+          # ----------------------------------------------------------------- mail ----
+          def mail(subject: str, body: str) -> None:
+              user, pw = os.environ.get("SMTP_USER"), os.environ.get("SMTP_PASS")
+              to = os.environ.get("MAIL_TO") or user
+              if not (user and pw and to):
+                  log(f"[no smtp configured] {subject}\n{body}")
+                  return
+              msg = EmailMessage()
+              msg["Subject"], msg["From"], msg["To"] = subject, user, to
+              msg.set_content(body)
+              try:
+                  with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as smtp:
+                      smtp.login(user, pw)
+                      smtp.send_message(msg)
+                  log(f"mail sent: {subject}")
+              except Exception as e:
+                  log(f"! mail failed: {e}")
+
+
+          # ----------------------------------------------------------------- main ----
+          def run_once() -> int:
+              """Returns 1 if a booking was made (stop looping), else 0."""
+              st = load_state()
+              if st.get("booked"):
+                  log(f"already booked {st['booked']['when']} - nothing to do")
+                  return 1
+
+              base = CFG["base"]
+              for concern in CFG["concerns"]:
+                  cnc, label = concern["cnc"], concern["label"]
+                  s = new_session()
+                  try:
+                      page = open_suggest(s, cnc).text
+                  except Exception as e:
+                      log(f"! fetch failed for {cnc}: {e}")
+                      continue
+
+                  status = page_status(page)
+                  log(f"[{datetime.now(TZ):%Y-%m-%d %H:%M}] {label}: {status}")
+                  if status == "none":
+                      continue
+
+                  if status in ("unknown", "captcha"):
+                      notify(st, f"Termin page changed ({status}) - {label}",
+                             f"The page is neither 'no slots' nor the known slot list.\n"
+                             f"Open it yourself:\n{base}/select2?md={CFG['md']}\n")
+                      continue
+
+                  slots = parse_slots(page)
+                  log(f"  {len(slots)} open slot(s): "
+                      + ", ".join(f"{x['_dt']:%d.%m %H:%M}" for x in slots[:8]))
+                  if not slots:
+                      continue
+
+                  good, reasons = eligible(slots)
+                  listing = "\n".join(f"  {x['_dt']:%a %d.%m.%Y %H:%M}" for x in slots[:30])
+
+                  if not good:
+                      why = reasons[:6] + ([f"...and {len(reasons) - 6} more"]
+                                           if len(reasons) > 6 else [])
+                      notify(st, f"Slots open but none fit - {label}",
+                             f"{len(slots)} slot(s) appeared (first 30):\n{listing}\n\n"
+                             f"Skipped because:\n  " + "\n  ".join(why or ["-"])
+                             + f"\n\nBook manually: {base}/select2?md={CFG['md']}")
+                      continue
+
+                  pick = good[0]
+                  if not CFG.get("autobook"):
+                      notify(st, f"SLOT OPEN - {label}",
+                             f"Best match: {pick['_dt']:%A %d.%m.%Y %H:%M}\n\n"
+                             f"All open:\n{listing}\n\n{base}/select2?md={CFG['md']}")
+                      continue
+
+                  ok, detail = book(s, pick, base)
+                  when = f"{pick['_dt']:%A %d.%m.%Y %H:%M}"
+                  if DRY:
+                      log(f"DRY_RUN: would have booked {when} -> {detail}")
+                      return 1
+                  if ok:
+                      st["booked"] = {"when": pick["_dt"].isoformat(), "label": label,
+                                      "booked_at": datetime.now(TZ).isoformat()}
+                      save_state(st)
+                      warn = (f"\n!! This slot CLASHES with your calendar: {pick['_clash']}.\n"
+                              f"   It was booked anyway because no conflict-free slot was\n"
+                              f"   available. Move the meeting or cancel the appointment.\n"
+                              if pick.get("_clash") else "")
+                      mail(f"BOOKED {when} - {label}",
+                           f"Reserved {when} at Hoeherweg 101.\n{warn}\n"
+                           f"Check your inbox for the city's confirmation mail - some\n"
+                           f"TEVIS instances require you to click a link to finalise it.\n\n"
+                           f"--- page ---\n{detail}")
+                      log(f"BOOKED {when}")
+                      return 1
+                  mail(f"BOOKING FAILED {when} - {label}",
+                       f"A slot was free but the booking did not complete.\n\n"
+                       f"Reason: {detail}\n\nGo book it now: {base}/select2?md={CFG['md']}")
+                  log(f"! booking failed: {detail}")
+
+              save_state(st)
+              return 0
+
+
+          def notify(st: dict, subject: str, body: str) -> None:
+              """Email, but at most once per cooldown window per subject kind."""
+              key = "alert:" + subject.split(" - ")[0]
+              cool = CFG.get("alert_cooldown_minutes", 120) * 60
+              last = st.get(key, 0)
+              if time.time() - last < cool:
+                  log(f"  (suppressed duplicate alert: {subject})")
+                  return
+              st[key] = time.time()
+              save_state(st)
+              mail(subject, body)
+
+
+          def main() -> int:
+              """Poll repeatedly inside one run, so a 5-min cron gives ~45s resolution."""
+              budget = int(os.environ.get("LOOP_SECONDS", "0"))
+              every = int(os.environ.get("POLL_INTERVAL", "45"))
+              deadline = time.monotonic() + budget
+              while True:
+                  try:
+                      if run_once():
+                          return 0
+                  except Exception as e:
+                      log(f"! run failed: {e}")
+                  if time.monotonic() + every >= deadline:
+                      return 0
+                  time.sleep(every)
+
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          ENDOFWATCHER
+          python -m py_compile watcher.py
+
+      - name: Watch and book
+        env:
+          LOOP_SECONDS: "240"
+          POLL_INTERVAL: "45"
+          DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
+          ICS_URL: ${{ secrets.ICS_URL }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+          BOOK_SEX: ${{ secrets.BOOK_SEX }}
+          BOOK_VORNAME: ${{ secrets.BOOK_VORNAME }}
+          BOOK_NACHNAME: ${{ secrets.BOOK_NACHNAME }}
+          BOOK_EMAIL: ${{ secrets.BOOK_EMAIL }}
+          BOOK_PHONE: ${{ secrets.BOOK_PHONE }}
+          BOOK_DOB: ${{ secrets.BOOK_DOB }}
+        run: python watcher.py
+
+      - name: Persist state
+        if: always()
+        run: |
+          [ -f state.json ] || exit 0
+          git config user.name  "termin-bot"
+          git config user.email "termin-bot@users.noreply.github.com"
+          git add -f state.json
+          git diff --cached --quiet && exit 0
+          git commit -q -m "state: $(date -u +%FT%TZ)"
+          git pull --rebase --autostash -q || true
+          git push -q

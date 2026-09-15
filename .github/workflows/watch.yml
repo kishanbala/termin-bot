@@ -457,6 +457,41 @@ jobs:
           ENDOFWATCHER
           python -m py_compile watcher.py
 
+      - name: Test calendar feed
+        env:
+          ICS_URL: ${{ secrets.ICS_URL }}
+        run: |
+          python - <<'ENDOFDIAG'
+          import os, sys
+          url = os.environ.get("ICS_URL", "").strip()
+          if not url:
+              print("ICS_URL secret is EMPTY or not set - bot will fall back to rules only, no calendar check.")
+              sys.exit(0)
+          print(f"ICS_URL is set, length {len(url)} chars, starts with: {url[:30]}...")
+          if not url.startswith("https://"):
+              print("!! WARNING: does not start with https:// - webcal:// links will fail. Fix the secret.")
+              sys.exit(1)
+          import requests
+          try:
+              r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+              print(f"HTTP {r.status_code}, {len(r.content)} bytes")
+              r.raise_for_status()
+          except Exception as e:
+              print(f"!! Fetch FAILED: {e}")
+              sys.exit(1)
+          if b"BEGIN:VCALENDAR" not in r.content:
+              print("!! Response does not look like an .ics file - check the link is the public/published one.")
+              sys.exit(1)
+          import icalendar, recurring_ical_events
+          from datetime import datetime, timedelta
+          cal = icalendar.Calendar.from_ical(r.content)
+          now = datetime.now()
+          events = recurring_ical_events.of(cal).between(now, now + timedelta(days=90))
+          print(f"OK - valid calendar feed, {len(events)} event(s) in the next 90 days.")
+          for e in events[:10]:
+              print(f"  - {e.get('DTSTART').dt} : {e.get('SUMMARY')}")
+          ENDOFDIAG
+
       - name: Watch and book
         env:
           LOOP_SECONDS: "240"

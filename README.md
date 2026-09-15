@@ -1,4 +1,4 @@
-````markdown
+````
 # termin-bot
 
 Watches `termine.duesseldorf.de` for **Umschreibung ausländischer Führerschein (sonstige Staaten)** and auto-books the first eligible slot.

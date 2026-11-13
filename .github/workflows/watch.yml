@@ -4,8 +4,7 @@ on:
   schedule:
     # Kick-offs only; the run then chains itself while inside the polling window.
     # 05:00 UTC = 07:00 Berlin (summer), 06:00 UTC = 07:00 Berlin (winter).
-    - cron: "0 5 * * 1-5"
-    - cron: "0 6 * * 1-5"
+    - cron: "7,37 5,6 * * 1-5"
   workflow_dispatch:
     inputs:
       dry_run:

@@ -539,4 +539,4 @@ jobs:
         if: hashFiles('chain.flag') != ''
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh workflow run termin-watch.yml -f dry_run=false
+        run: gh workflow run "$(basename "${GITHUB_WORKFLOW_REF%@*}")" --ref "$GITHUB_REF_NAME" -f dry_run=false

@@ -2,7 +2,10 @@ name: termin-watch
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    # Kick-offs only; the run then chains itself while inside the polling window.
+    # 05:00 UTC = 07:00 Berlin (summer), 06:00 UTC = 07:00 Berlin (winter).
+    - cron: "0 5 * * 1-5"
+    - cron: "0 6 * * 1-5"
   workflow_dispatch:
     inputs:
       dry_run:
@@ -12,6 +15,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 concurrency:
   group: termin-watch
@@ -20,7 +24,7 @@ concurrency:
 jobs:
   watch:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 9
     steps:
       - uses: actions/checkout@v4
 
@@ -84,7 +88,7 @@ jobs:
               ],
               "autobook": True,
               "rules": {
-                  "min_days_ahead": 2,
+                  "min_days_ahead": 1,
                   "max_days_ahead": 365,
                   "weekdays": None,
                   "earliest": "07:00",
@@ -103,6 +107,12 @@ jobs:
                   "calendar_conflicts": "prefer_free",
               },
               "alert_cooldown_minutes": 120,
+              # Live runs only poll inside these Europe/Berlin windows (GitHub's free tier
+              # allows ~2,000 runner-minutes/month, so 24/7 polling is not possible).
+              "windows": {
+                  "days": [0, 1, 2, 3, 4],          # Mon-Fri; the city only releases weekdays
+                  "ranges": [["07:00", "08:30"]],
+              },
           }
           STATE_PATH = ROOT / "state.json"
           TZ = ZoneInfo("Europe/Berlin")
@@ -229,6 +239,16 @@ jobs:
           def hhmm(v: str) -> int:
               h, m = v.split(":")
               return int(h) * 60 + int(m)
+
+
+          def in_window(now: datetime) -> bool:
+              w = CFG.get("windows")
+              if not w:
+                  return True
+              if now.weekday() not in w["days"]:
+                  return False
+              mins = now.hour * 60 + now.minute
+              return any(hhmm(a) <= mins < hhmm(b) for a, b in w["ranges"])
 
 
           def eligible(slots: list[dict]) -> tuple[list[dict], list[str]]:
@@ -446,19 +466,37 @@ jobs:
 
 
           def main() -> int:
-              """Poll repeatedly inside one run, so a 5-min cron gives ~45s resolution."""
+              """Poll in a loop. Live runs are gated to the polling windows and, while
+              still inside one, ask the workflow to chain a successor run (chain.flag)."""
               budget = int(os.environ.get("LOOP_SECONDS", "0"))
-              every = int(os.environ.get("POLL_INTERVAL", "45"))
+              every = int(os.environ.get("POLL_INTERVAL", "10"))
+              gated = not DRY and os.environ.get("IGNORE_WINDOW") != "1"
               deadline = time.monotonic() + budget
+              flag = ROOT / "chain.flag"
+              flag.unlink(missing_ok=True)
+
+              want_chain = False
               while True:
+                  if gated and not in_window(datetime.now(TZ)):
+                      log(f"[{datetime.now(TZ):%a %H:%M}] outside polling window - stopping")
+                      want_chain = False
+                      break
                   try:
-                      if run_once():
-                          return 0
+                      done = run_once()
                   except Exception as e:
                       log(f"! run failed: {e}")
+                      done = 0
+                  if done:                       # booked (or dry-run finished) - no successor
+                      want_chain = False
+                      break
+                  want_chain = True
                   if time.monotonic() + every >= deadline:
-                      return 0
+                      break
                   time.sleep(every)
+
+              if want_chain and gated:
+                  flag.write_text("1")
+              return 0
 
 
           if __name__ == "__main__":
@@ -466,45 +504,10 @@ jobs:
           ENDOFWATCHER
           python -m py_compile watcher.py
 
-      - name: Test calendar feed
-        env:
-          ICS_URL: ${{ secrets.ICS_URL }}
-        run: |
-          python - <<'ENDOFDIAG'
-          import os, sys
-          url = os.environ.get("ICS_URL", "").strip()
-          if not url:
-              print("ICS_URL secret is EMPTY or not set - bot will fall back to rules only, no calendar check.")
-              sys.exit(0)
-          print(f"ICS_URL is set, length {len(url)} chars, starts with: {url[:30]}...")
-          if not url.startswith("https://"):
-              print("!! WARNING: does not start with https:// - webcal:// links will fail. Fix the secret.")
-              sys.exit(1)
-          import requests
-          try:
-              r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
-              print(f"HTTP {r.status_code}, {len(r.content)} bytes")
-              r.raise_for_status()
-          except Exception as e:
-              print(f"!! Fetch FAILED: {e}")
-              sys.exit(1)
-          if b"BEGIN:VCALENDAR" not in r.content:
-              print("!! Response does not look like an .ics file - check the link is the public/published one.")
-              sys.exit(1)
-          import icalendar, recurring_ical_events
-          from datetime import datetime, timedelta
-          cal = icalendar.Calendar.from_ical(r.content)
-          now = datetime.now()
-          events = recurring_ical_events.of(cal).between(now, now + timedelta(days=90))
-          print(f"OK - valid calendar feed, {len(events)} event(s) in the next 90 days.")
-          for e in events[:10]:
-              print(f"  - {e.get('DTSTART').dt} : {e.get('SUMMARY')}")
-          ENDOFDIAG
-
       - name: Watch and book
         env:
-          LOOP_SECONDS: "240"
-          POLL_INTERVAL: "45"
+          LOOP_SECONDS: "420"
+          POLL_INTERVAL: "10"
           DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
           ICS_URL: ${{ secrets.ICS_URL }}
           SMTP_USER: ${{ secrets.SMTP_USER }}
@@ -529,3 +532,9 @@ jobs:
           git commit -q -m "state: $(date -u +%FT%TZ)"
           git pull --rebase --autostash -q || true
           git push -q
+
+      - name: Chain next run
+        if: hashFiles('chain.flag') != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run termin-watch.yml -f dry_run=false

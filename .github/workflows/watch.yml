@@ -3,8 +3,11 @@ name: termin-watch
 on:
   schedule:
     # Kick-offs only; the run then chains itself while inside the polling window.
-    # 05:00 UTC = 07:00 Berlin (summer), 06:00 UTC = 07:00 Berlin (winter).
-    - cron: "7,37 5,6 * * 1-5"
+    # GitHub delays/drops scheduled runs, so we ask 7 times per morning.
+    # Winter time (UTC+1): 06:50-08:20 Berlin. Shift one hour earlier in summer.
+    - cron: "50 5 * * 1-5"
+    - cron: "5,20,35,50 6 * * 1-5"
+    - cron: "5,20 7 * * 1-5"
   workflow_dispatch:
     inputs:
       dry_run:

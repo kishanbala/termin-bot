@@ -79,7 +79,7 @@ jobs:
               "concerns": [
                   {
                       "cnc": 5871,
-                      "label": "Umschreibung auslaendischer Fuehrerschein (sonstige Staaten)"
+                      "label": "Umschreibung auslaendischer Fuehrerschein (sonstige Staaten)",
                   }
               ],
               "autobook": True,
@@ -91,15 +91,18 @@ jobs:
                   "latest": "17:00",
                   "duration_minutes": 15,
                   "buffer_minutes": 45,
+                  # whole-day no-book windows, inclusive
                   "blackout": [
-                      [
-                          "2026-10-28",
-                          "2026-12-03"
-                      ]
+                      ["2026-10-28", "2026-11-30"]
                   ],
-                  "calendar_conflicts": "prefer_free"
+                  # per-day overrides of earliest/latest (either key optional).
+                  # 2 Dec: workshop until ~14:00, so only 14:00-17:00 is bookable that day.
+                  "date_overrides": {
+                      "2026-12-02": {"earliest": "14:00"}
+                  },
+                  "calendar_conflicts": "prefer_free",
               },
-              "alert_cooldown_minutes": 120
+              "alert_cooldown_minutes": 120,
           }
           STATE_PATH = ROOT / "state.json"
           TZ = ZoneInfo("Europe/Berlin")
@@ -233,13 +236,14 @@ jobs:
               today = datetime.now(TZ).date()
               lo_day = today + timedelta(days=r["min_days_ahead"])
               hi_day = today + timedelta(days=r["max_days_ahead"])
-              lo_min, hi_min = hhmm(r["earliest"]), hhmm(r["latest"])
+              base_lo_min, base_hi_min = hhmm(r["earliest"]), hhmm(r["latest"])
               dur = timedelta(minutes=r["duration_minutes"])
               buf = timedelta(minutes=r["buffer_minutes"])
 
               blackout = [(date.fromisoformat(a), date.fromisoformat(b))
                           for a, b in r.get("blackout", [])]
               weekdays = r.get("weekdays")  # null/absent = any day the city offers
+              overrides = r.get("date_overrides", {})  # "YYYY-MM-DD" -> {earliest?/latest?}
 
               by_rule, reasons = [], []
               for s in slots:
@@ -251,8 +255,13 @@ jobs:
                       continue
                   if weekdays and dt.weekday() not in weekdays:
                       continue
+
+                  ov = overrides.get(dt.date().isoformat(), {})
+                  lo_min = hhmm(ov["earliest"]) if "earliest" in ov else base_lo_min
+                  hi_min = hhmm(ov["latest"]) if "latest" in ov else base_hi_min
                   if not (lo_min <= mins <= hi_min):
                       continue
+
                   by_rule.append(s)
 
               if not by_rule:
@@ -340,6 +349,19 @@ jobs:
                   log(f"! mail failed: {e}")
 
 
+          def notify(st: dict, subject: str, body: str) -> None:
+              """Email, but at most once per cooldown window per subject kind."""
+              key = "alert:" + subject.split(" - ")[0]
+              cool = CFG.get("alert_cooldown_minutes", 120) * 60
+              last = st.get(key, 0)
+              if time.time() - last < cool:
+                  log(f"  (suppressed duplicate alert: {subject})")
+                  return
+              st[key] = time.time()
+              save_state(st)
+              mail(subject, body)
+
+
           # ----------------------------------------------------------------- main ----
           def run_once() -> int:
               """Returns 1 if a booking was made (stop looping), else 0."""
@@ -421,19 +443,6 @@ jobs:
 
               save_state(st)
               return 0
-
-
-          def notify(st: dict, subject: str, body: str) -> None:
-              """Email, but at most once per cooldown window per subject kind."""
-              key = "alert:" + subject.split(" - ")[0]
-              cool = CFG.get("alert_cooldown_minutes", 120) * 60
-              last = st.get(key, 0)
-              if time.time() - last < cool:
-                  log(f"  (suppressed duplicate alert: {subject})")
-                  return
-              st[key] = time.time()
-              save_state(st)
-              mail(subject, body)
 
 
           def main() -> int:

@@ -2,12 +2,9 @@ name: termin-watch
 
 on:
   schedule:
-    # Kick-offs only; the run then chains itself while inside the polling window.
-    # GitHub delays/drops scheduled runs, so we ask 7 times per morning.
-    # Winter time (UTC+1): 06:50-08:20 Berlin. Shift one hour earlier in summer.
-    - cron: "50 5 * * 1-5"
-    - cron: "5,20,35,50 6 * * 1-5"
-    - cron: "5,20 7 * * 1-5"
+    # Kick-offs only: each run polls ~55 min, then chains its successor.
+    # These restart the chain if a run ever fails. UTC; covers 06:00-23:00 Berlin.
+    - cron: "3,33 4-21 * * *"
   workflow_dispatch:
     inputs:
       dry_run:
@@ -26,7 +23,7 @@ concurrency:
 jobs:
   watch:
     runs-on: ubuntu-latest
-    timeout-minutes: 9
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -112,9 +109,12 @@ jobs:
               # Live runs only poll inside these Europe/Berlin windows (GitHub's free tier
               # allows ~2,000 runner-minutes/month, so 24/7 polling is not possible).
               "windows": {
-                  "days": [0, 1, 2, 3, 4],          # Mon-Fri; the city only releases weekdays
-                  "ranges": [["07:00", "08:30"]],
+                  "days": [0, 1, 2, 3, 4, 5, 6],
+                  "ranges": [["06:00", "23:00"]],
               },
+              # Seconds between polls: fast on weekdays in office hours, slower otherwise.
+              "fast": {"days": [0, 1, 2, 3, 4], "ranges": [["06:00", "18:00"]],
+                       "interval": 5, "else": 15},
           }
           STATE_PATH = ROOT / "state.json"
           TZ = ZoneInfo("Europe/Berlin")
@@ -198,6 +198,9 @@ jobs:
 
 
           # ------------------------------------------------------------- calendar ----
+          _CAL = {"at": -1e9, "cal": None}
+
+
           def busy_intervals(window_end: datetime) -> list[tuple[datetime, datetime]]:
               """Expanded busy blocks from the secret iCal feed. Empty on any failure."""
               url = os.environ.get("ICS_URL", "").strip()
@@ -206,8 +209,11 @@ jobs:
               try:
                   import icalendar
                   import recurring_ical_events
-                  raw = requests.get(url, timeout=30, headers={"User-Agent": UA}).content
-                  cal = icalendar.Calendar.from_ical(raw)
+                  if time.monotonic() - _CAL["at"] > 600 or _CAL["cal"] is None:
+                      raw = requests.get(url, timeout=10, headers={"User-Agent": UA}).content
+                      _CAL["cal"] = icalendar.Calendar.from_ical(raw)
+                      _CAL["at"] = time.monotonic()
+                  cal = _CAL["cal"]
                   lo = datetime.now(TZ)
                   events = recurring_ical_events.of(cal).between(lo, window_end)
               except Exception as e:  # never let calendar trouble block a booking
@@ -251,6 +257,14 @@ jobs:
                   return False
               mins = now.hour * 60 + now.minute
               return any(hhmm(a) <= mins < hhmm(b) for a, b in w["ranges"])
+
+
+          def poll_interval(now: datetime) -> int:
+              f = CFG["fast"]
+              mins = now.hour * 60 + now.minute
+              hot = now.weekday() in f["days"] and any(
+                  hhmm(a) <= mins < hhmm(b) for a, b in f["ranges"])
+              return f["interval"] if hot else f["else"]
 
 
           def eligible(slots: list[dict]) -> tuple[list[dict], list[str]]:
@@ -386,7 +400,7 @@ jobs:
 
           # ----------------------------------------------------------------- main ----
           def run_once() -> int:
-              """Returns 1 if a booking was made (stop looping), else 0."""
+              """Returns 1 if booked (stop), 2 if a booking attempt failed (retry now), else 0."""
               st = load_state()
               if st.get("booked"):
                   log(f"already booked {st['booked']['when']} - nothing to do")
@@ -458,10 +472,12 @@ jobs:
                            f"--- page ---\n{detail}")
                       log(f"BOOKED {when}")
                       return 1
-                  mail(f"BOOKING FAILED {when} - {label}",
+                  notify(st, f"BOOKING FAILED - {label}",
                        f"A slot was free but the booking did not complete.\n\n"
                        f"Reason: {detail}\n\nGo book it now: {base}/select2?md={CFG['md']}")
                   log(f"! booking failed: {detail}")
+                  save_state(st)
+                  return 2
 
               save_state(st)
               return 0
@@ -471,16 +487,20 @@ jobs:
               """Poll in a loop. Live runs are gated to the polling windows and, while
               still inside one, ask the workflow to chain a successor run (chain.flag)."""
               budget = int(os.environ.get("LOOP_SECONDS", "0"))
-              every = int(os.environ.get("POLL_INTERVAL", "10"))
+              if DRY:
+                  budget = min(budget, 60)
               gated = not DRY and os.environ.get("IGNORE_WINDOW") != "1"
               deadline = time.monotonic() + budget
               flag = ROOT / "chain.flag"
               flag.unlink(missing_ok=True)
+              busy_intervals(datetime.now(TZ) + timedelta(days=1))   # warm the calendar cache
 
               want_chain = False
+              retries = 0
               while True:
-                  if gated and not in_window(datetime.now(TZ)):
-                      log(f"[{datetime.now(TZ):%a %H:%M}] outside polling window - stopping")
+                  now = datetime.now(TZ)
+                  if gated and not in_window(now):
+                      log(f"[{now:%a %H:%M}] outside polling window - stopping")
                       want_chain = False
                       break
                   try:
@@ -488,10 +508,15 @@ jobs:
                   except Exception as e:
                       log(f"! run failed: {e}")
                       done = 0
-                  if done:                       # booked (or dry-run finished) - no successor
+                  if done == 1:                  # booked (or dry-run finished) - no successor
                       want_chain = False
                       break
                   want_chain = True
+                  if done == 2 and retries < 3:  # lost the race for a slot - look again at once
+                      retries += 1
+                      continue
+                  retries = 0
+                  every = poll_interval(now)
                   if time.monotonic() + every >= deadline:
                       break
                   time.sleep(every)
@@ -508,8 +533,7 @@ jobs:
 
       - name: Watch and book
         env:
-          LOOP_SECONDS: "420"
-          POLL_INTERVAL: "10"
+          LOOP_SECONDS: "3300"
           DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
           ICS_URL: ${{ secrets.ICS_URL }}
           SMTP_USER: ${{ secrets.SMTP_USER }}
